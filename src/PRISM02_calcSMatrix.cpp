@@ -18,6 +18,8 @@
 #include <thread>
 #include "fftw3.h"
 #include <mutex>
+#include <unordered_map>
+#include <limits>
 #include "ArrayND.h"
 #include <complex>
 #include "utility.h"
@@ -148,119 +150,297 @@ inline void setupBeams(Parameters<PRISMATIC_FLOAT_PRECISION> &pars)
 	}
 
 	// number the beams
-	pars.beams = zeros_ND<2, PRISMATIC_FLOAT_PRECISION>({{pars.imageSize[0], pars.imageSize[1]}});
-	pars.beamsIndex = {}; //clear index
-	{
-		int beam_count = 1;
-		for (auto y = 0; y < pars.qMask.get_dimj(); ++y)
-		{
+        pars.beams = zeros_ND<2, PRISMATIC_FLOAT_PRECISION>({{pars.imageSize[0], pars.imageSize[1]}});
+        pars.beamsIndex = {}; //clear index
+        pars.beamsIndexInterpolation = {};
+        {
+                int beam_count = 1;
+                for (auto y = 0; y < pars.qMask.get_dimj(); ++y)
+                {
 			for (auto x = 0; x < pars.qMask.get_dimi(); ++x)
 			{
-				if (mask.at(y, x) == 1)
-				{
-					pars.beamsIndex.push_back((size_t)y * pars.qMask.get_dimi() + (size_t)x);
-					pars.beams.at(y, x) = beam_count++;
-				}
-			}
-		}
-	}
+                                if (mask.at(y, x) == 1)
+                                {
+                                        pars.beamsIndex.push_back((size_t)y * pars.qMask.get_dimi() + (size_t)x);
+                                        pars.beamsIndexInterpolation.push_back((size_t)y * pars.qMask.get_dimi() + (size_t)x);
+                                        pars.beams.at(y, x) = beam_count++;
+                                }
+                        }
+                }
+        }
+        pars.numberBeamsInterpolation = pars.numberBeams;
+}
+
+struct HRTEMInterpolationInfo
+{
+        std::array<size_t, 4> indices;
+        std::array<PRISMATIC_FLOAT_PRECISION, 4> weights;
+};
+
+inline size_t findNearestBeam(const Parameters<PRISMATIC_FLOAT_PRECISION> &pars,
+                                                        const std::vector<size_t> &beamIndices,
+                                                        const PRISMATIC_FLOAT_PRECISION targetQx,
+                                                        const PRISMATIC_FLOAT_PRECISION targetQy)
+{
+        size_t closestIndex = 0;
+        PRISMATIC_FLOAT_PRECISION closestDistance = std::numeric_limits<PRISMATIC_FLOAT_PRECISION>::max();
+        for (const auto &flatIndex : beamIndices)
+        {
+                const size_t xIdx = flatIndex % pars.imageSize[1];
+                const size_t yIdx = flatIndex / pars.imageSize[1];
+                const PRISMATIC_FLOAT_PRECISION dx = pars.qxa.at(yIdx, xIdx) - targetQx;
+                const PRISMATIC_FLOAT_PRECISION dy = pars.qya.at(yIdx, xIdx) - targetQy;
+                const PRISMATIC_FLOAT_PRECISION distance = dx * dx + dy * dy;
+                if (distance < closestDistance)
+                {
+                        closestDistance = distance;
+                        closestIndex = flatIndex;
+                }
+        }
+        return closestIndex;
+}
+
+inline HRTEMInterpolationInfo getInterpolationInfo(
+        const Parameters<PRISMATIC_FLOAT_PRECISION> &pars,
+        const PRISMATIC_FLOAT_PRECISION meshX,
+        const PRISMATIC_FLOAT_PRECISION meshY,
+        const PRISMATIC_FLOAT_PRECISION targetQx,
+        const PRISMATIC_FLOAT_PRECISION targetQy,
+        const long interp_fx,
+        const long interp_fy,
+        const std::unordered_map<size_t, size_t> &beamLookup,
+        const std::vector<size_t> &beamIndices)
+{
+        HRTEMInterpolationInfo info{{0, 0, 0, 0}, {0, 0, 0, 0}};
+
+        if (beamIndices.empty())
+        {
+                return info;
+        }
+
+        const auto clampMeshCoord = [](const PRISMATIC_FLOAT_PRECISION coord, const long dim) {
+                const PRISMATIC_FLOAT_PRECISION limit = std::floor(static_cast<PRISMATIC_FLOAT_PRECISION>(dim) / 2.0);
+                const PRISMATIC_FLOAT_PRECISION maxCoord = (dim % 2 == 0) ? limit - 1 : limit;
+                return std::max(-limit, std::min(coord, maxCoord));
+        };
+
+        const auto meshToIndex = [&](const PRISMATIC_FLOAT_PRECISION meshCoord, const long dim) {
+                const PRISMATIC_FLOAT_PRECISION clamped = clampMeshCoord(meshCoord, dim);
+                const long nc = dim / 2;
+                long idx = static_cast<long>(std::llround(clamped + static_cast<PRISMATIC_FLOAT_PRECISION>(nc)));
+                if (idx < 0)
+                        idx += dim;
+                return static_cast<size_t>(idx % dim);
+        };
+
+        const PRISMATIC_FLOAT_PRECISION clampedMeshX = clampMeshCoord(meshX, static_cast<long>(pars.imageSize[1]));
+        const PRISMATIC_FLOAT_PRECISION clampedMeshY = clampMeshCoord(meshY, static_cast<long>(pars.imageSize[0]));
+
+        const PRISMATIC_FLOAT_PRECISION baseMeshX = std::floor(clampedMeshX / interp_fx) * interp_fx;
+        const PRISMATIC_FLOAT_PRECISION baseMeshY = std::floor(clampedMeshY / interp_fy) * interp_fy;
+        const PRISMATIC_FLOAT_PRECISION upperMeshX = clampMeshCoord(baseMeshX + interp_fx, static_cast<long>(pars.imageSize[1]));
+        const PRISMATIC_FLOAT_PRECISION upperMeshY = clampMeshCoord(baseMeshY + interp_fy, static_cast<long>(pars.imageSize[0]));
+
+        const PRISMATIC_FLOAT_PRECISION dx = std::min<PRISMATIC_FLOAT_PRECISION>(
+                1.0, std::max<PRISMATIC_FLOAT_PRECISION>(0.0, (clampedMeshX - baseMeshX) / interp_fx));
+        const PRISMATIC_FLOAT_PRECISION dy = std::min<PRISMATIC_FLOAT_PRECISION>(
+                1.0, std::max<PRISMATIC_FLOAT_PRECISION>(0.0, (clampedMeshY - baseMeshY) / interp_fy));
+
+        info.weights = { (1.0 - dx) * (1.0 - dy),
+                                         dx * (1.0 - dy),
+                                         (1.0 - dx) * dy,
+                                         dx * dy };
+
+        const std::array<PRISMATIC_FLOAT_PRECISION, 2> xOptions{baseMeshX, upperMeshX};
+        const std::array<PRISMATIC_FLOAT_PRECISION, 2> yOptions{baseMeshY, upperMeshY};
+
+        const size_t nearestBeam = findNearestBeam(pars, beamIndices, targetQx, targetQy);
+        size_t fallbackIndex = 0;
+        const auto nearestIt = beamLookup.find(nearestBeam);
+        if (nearestIt != beamLookup.end())
+        {
+                fallbackIndex = nearestIt->second;
+        }
+
+        size_t slot = 0;
+        for (const auto &yCoord : yOptions)
+        {
+                for (const auto &xCoord : xOptions)
+                {
+                        const size_t xIdx = meshToIndex(xCoord, static_cast<long>(pars.imageSize[1]));
+                        const size_t yIdx = meshToIndex(yCoord, static_cast<long>(pars.imageSize[0]));
+                        const size_t flatIndex = yIdx * pars.imageSize[1] + xIdx;
+                        const auto it = beamLookup.find(flatIndex);
+                        if (it != beamLookup.end())
+                        {
+                                info.indices[slot] = it->second;
+                        }
+                        else
+                        {
+                                info.indices[slot] = fallbackIndex;
+                        }
+                        ++slot;
+                }
+        }
+
+        return info;
 }
 
 inline void setupBeams_HRTEM(Parameters<PRISMATIC_FLOAT_PRECISION> &pars)
 {
-	// determine which beams (AKA plane waves, or Fourier components) are relevant for the calculation
+        // determine which beams (AKA plane waves, or Fourier components) are relevant for the calculation
 
-	Array1D<PRISMATIC_FLOAT_PRECISION> xv = makeFourierCoords(pars.imageSize[1],
-															  (PRISMATIC_FLOAT_PRECISION)1 / pars.imageSize[1]);
-	Array1D<PRISMATIC_FLOAT_PRECISION> yv = makeFourierCoords(pars.imageSize[0],
-															  (PRISMATIC_FLOAT_PRECISION)1 / pars.imageSize[0]);
-	pair<Array2D<PRISMATIC_FLOAT_PRECISION>, Array2D<PRISMATIC_FLOAT_PRECISION>> mesh_a = meshgrid(yv, xv);
+        Array1D<PRISMATIC_FLOAT_PRECISION> xv = makeFourierCoords(pars.imageSize[1],
+                                                                                                                          (PRISMATIC_FLOAT_PRECISION)1 / pars.imageSize[1]);
+        Array1D<PRISMATIC_FLOAT_PRECISION> yv = makeFourierCoords(pars.imageSize[0],
+                                                                                                                          (PRISMATIC_FLOAT_PRECISION)1 / pars.imageSize[0]);
+        pair<Array2D<PRISMATIC_FLOAT_PRECISION>, Array2D<PRISMATIC_FLOAT_PRECISION>> mesh_a = meshgrid(yv, xv);
 
-	// create beam mask and count beams
-	Prismatic::Array2D<unsigned int> mask;
-	mask = zeros_ND<2, unsigned int>({{pars.imageSize[0], pars.imageSize[1]}});
-	pars.numberBeams = 0;
-	
-	PRISMATIC_FLOAT_PRECISION minXstep = pars.lambda / pars.tiledCellDim[2];
-	PRISMATIC_FLOAT_PRECISION minYstep = pars.lambda / pars.tiledCellDim[1];
+        // create beam mask and count beams
+        Prismatic::Array2D<unsigned int> mask = zeros_ND<2, unsigned int>({{pars.imageSize[0], pars.imageSize[1]}});
+        Prismatic::Array2D<unsigned int> interpolationMask = zeros_ND<2, unsigned int>({{pars.imageSize[0], pars.imageSize[1]}});
+        pars.numberBeams = 0;
+        pars.numberBeamsInterpolation = 0;
 
-	long interp_fx;
-	long interp_fy;
+        PRISMATIC_FLOAT_PRECISION minXstep = pars.lambda / pars.tiledCellDim[2];
+        PRISMATIC_FLOAT_PRECISION minYstep = pars.lambda / pars.tiledCellDim[1];
 
-	if(pars.meta.tiltMode == TiltSelection::Rectangular)
-	{
+        long interp_fx;
+        long interp_fy;
 
-		interp_fx = (pars.xTiltStep_tem >= minXstep) ? (long)round(pars.xTiltStep_tem / minXstep): 1; //use interpolation factor to control tilt step selection
-		interp_fy = (pars.xTiltStep_tem >= minYstep) ? (long)round(pars.yTiltStep_tem / minYstep): 1; //use interpolation factor to control tilt step selection
-	}
-	else
-	{
-		interp_fx = pars.meta.interpolationFactorX;
-		interp_fy = pars.meta.interpolationFactorY;
-	}
+        if(pars.meta.tiltMode == TiltSelection::Rectangular)
+        {
 
-	PRISMATIC_FLOAT_PRECISION relTiltX = 0.0;
-	PRISMATIC_FLOAT_PRECISION relTiltY = 0.0;
-	
-	pars.xTilts_tem = {};
-	pars.yTilts_tem = {};
-	pars.xTiltsInd_tem = {};
-	pars.yTiltsInd_tem = {};
-	for (auto y = 0; y < pars.qMask.get_dimj(); ++y)
-	{
-		for (auto x = 0; x < pars.qMask.get_dimi(); ++x)
-		{	//only get one beam
-			relTiltX = std::abs(pars.qxa.at(y, x)*pars.lambda - pars.xTiltOffset_tem);
-			relTiltY = std::abs(pars.qya.at(y, x)*pars.lambda - pars.yTiltOffset_tem);
-			bool beamCheck;
-			if(pars.meta.tiltMode == TiltSelection::Rectangular)
-			{
-				beamCheck = ((relTiltX <= pars.maxXtilt_tem and relTiltY <= pars.maxYtilt_tem) and 
-							(relTiltX >= pars.minXtilt_tem or relTiltY >= pars.minYtilt_tem )) and
-							(long)round(mesh_a.first.at(y, x)) % interp_fy == 0 and
-							(long)round(mesh_a.second.at(y, x)) % interp_fx == 0 and 
-							pars.qMask.at(y, x) == 1;
-			}
-			else
-			{
-				PRISMATIC_FLOAT_PRECISION cur_qr = sqrt(pow(relTiltX, 2) + pow(relTiltY,2));
-				beamCheck = (cur_qr <= pars.meta.maxRtilt and cur_qr >= pars.meta.minRtilt) and
-							(long)round(mesh_a.first.at(y, x)) % interp_fy == 0 and
-							(long)round(mesh_a.second.at(y, x)) % interp_fx == 0 and 
-							pars.qMask.at(y, x) == 1;
-			}
+                interp_fx = (pars.xTiltStep_tem >= minXstep) ? (long)round(pars.xTiltStep_tem / minXstep): 1; //use interpolation factor to control tilt step selection
+                interp_fy = (pars.xTiltStep_tem >= minYstep) ? (long)round(pars.yTiltStep_tem / minYstep): 1; //use interpolation factor to control tilt step selection
+        }
+        else
+        {
+                interp_fx = pars.meta.interpolationFactorX;
+                interp_fy = pars.meta.interpolationFactorY;
+        }
 
-			if (beamCheck)
-			{
-				mask.at(y, x) = 1;
-				pars.xTilts_tem.push_back(pars.qxa.at(y, x)*pars.lambda);
-				pars.yTilts_tem.push_back(pars.qya.at(y, x)*pars.lambda);
-				pars.xTiltsInd_tem.push_back((int) round(mesh_a.second.at(y, x)) / interp_fx);
-				pars.yTiltsInd_tem.push_back((int) round(mesh_a.first.at(y, x)) / interp_fy);
-				++pars.numberBeams;
-			}
-		}
-	}
+        PRISMATIC_FLOAT_PRECISION relTiltX = 0.0;
+        PRISMATIC_FLOAT_PRECISION relTiltY = 0.0;
 
-	std::cout << "Number of total tilts: " << pars.numberBeams << std::endl;
-	// number the beams
-	pars.beams = zeros_ND<2, PRISMATIC_FLOAT_PRECISION>({{pars.imageSize[0], pars.imageSize[1]}});
-	pars.beamsIndex = {};
-	{
-		int beam_count = 1;
-		for (auto y = 0; y < pars.qMask.get_dimj(); ++y)
-		{
-			for (auto x = 0; x < pars.qMask.get_dimi(); ++x)
-			{
-				if (mask.at(y, x) == 1)
-				{
-					pars.beamsIndex.push_back((size_t)y * pars.qMask.get_dimi() + (size_t)x);
-					pars.beams.at(y, x) = beam_count++;
-				}
-			}
-		}
-	}
+        pars.xTilts_tem = {};
+        pars.yTilts_tem = {};
+        pars.xTiltsInd_tem = {};
+        pars.yTiltsInd_tem = {};
+        pars.hrtemInterpolationIndices = {};
+        pars.hrtemInterpolationWeights = {};
+
+        // identify the coarse beams used for interpolation
+        for (auto y = 0; y < pars.qMask.get_dimj(); ++y)
+        {
+                for (auto x = 0; x < pars.qMask.get_dimi(); ++x)
+                {
+                        relTiltX = std::abs(pars.qxa.at(y, x)*pars.lambda - pars.xTiltOffset_tem);
+                        relTiltY = std::abs(pars.qya.at(y, x)*pars.lambda - pars.yTiltOffset_tem);
+                        bool beamCheck;
+                        if(pars.meta.tiltMode == TiltSelection::Rectangular)
+                        {
+                                beamCheck = ((relTiltX <= pars.maxXtilt_tem and relTiltY <= pars.maxYtilt_tem) and
+                                                        (relTiltX >= pars.minXtilt_tem or relTiltY >= pars.minYtilt_tem )) and
+                                                        pars.qMask.at(y, x) == 1;
+                        }
+                        else
+                        {
+                                PRISMATIC_FLOAT_PRECISION cur_qr = sqrt(pow(relTiltX, 2) + pow(relTiltY,2));
+                                beamCheck = (cur_qr <= pars.meta.maxRtilt and cur_qr >= pars.meta.minRtilt) and
+                                                        pars.qMask.at(y, x) == 1;
+                        }
+
+                        if (beamCheck && (long)round(mesh_a.first.at(y, x)) % interp_fy == 0 && (long)round(mesh_a.second.at(y, x)) % interp_fx == 0)
+                        {
+                                interpolationMask.at(y, x) = 1;
+                                ++pars.numberBeamsInterpolation;
+                        }
+                }
+        }
+
+        // build lookup for interpolation beams
+        pars.beamsIndexInterpolation = {};
+        std::unordered_map<size_t, size_t> interpolationLookup;
+        pars.beams = zeros_ND<2, PRISMATIC_FLOAT_PRECISION>({{pars.imageSize[0], pars.imageSize[1]}});
+        for (auto y = 0; y < pars.qMask.get_dimj(); ++y)
+        {
+                for (auto x = 0; x < pars.qMask.get_dimi(); ++x)
+                {
+                        if (interpolationMask.at(y, x) == 1)
+                        {
+                                const size_t flatIndex = (size_t)y * pars.qMask.get_dimi() + (size_t)x;
+                                interpolationLookup[flatIndex] = pars.beamsIndexInterpolation.size();
+                                pars.beamsIndexInterpolation.push_back(flatIndex);
+                        }
+                }
+        }
+        pars.numberBeamsInterpolation = pars.beamsIndexInterpolation.size();
+
+        // map requested tilts onto coarse beam grid
+        std::vector<size_t> requestedIndices;
+        for (auto y = 0; y < pars.qMask.get_dimj(); ++y)
+        {
+                for (auto x = 0; x < pars.qMask.get_dimi(); ++x)
+                {       //only get one beam
+                        relTiltX = std::abs(pars.qxa.at(y, x)*pars.lambda - pars.xTiltOffset_tem);
+                        relTiltY = std::abs(pars.qya.at(y, x)*pars.lambda - pars.yTiltOffset_tem);
+                        bool beamCheck;
+                        if(pars.meta.tiltMode == TiltSelection::Rectangular)
+                        {
+                                beamCheck = ((relTiltX <= pars.maxXtilt_tem and relTiltY <= pars.maxYtilt_tem) and
+                                                        (relTiltX >= pars.minXtilt_tem or relTiltY >= pars.minYtilt_tem )) and
+                                                        pars.qMask.at(y, x) == 1;
+                        }
+                        else
+                        {
+                                PRISMATIC_FLOAT_PRECISION cur_qr = sqrt(pow(relTiltX, 2) + pow(relTiltY,2));
+                                beamCheck = (cur_qr <= pars.meta.maxRtilt and cur_qr >= pars.meta.minRtilt) and
+                                                        pars.qMask.at(y, x) == 1;
+                        }
+
+                        if (beamCheck)
+                        {
+                                mask.at(y, x) = 1;
+                                const size_t flatIndex = (size_t)y * pars.qMask.get_dimi() + (size_t)x;
+                                pars.xTilts_tem.push_back(pars.qxa.at(y, x)*pars.lambda);
+                                pars.yTilts_tem.push_back(pars.qya.at(y, x)*pars.lambda);
+                                pars.xTiltsInd_tem.push_back((int) round(mesh_a.second.at(y, x)) / interp_fx);
+                                pars.yTiltsInd_tem.push_back((int) round(mesh_a.first.at(y, x)) / interp_fy);
+                                requestedIndices.push_back(flatIndex);
+
+                                auto interpInfo = getInterpolationInfo(pars,
+                                        mesh_a.second.at(y, x),
+                                        mesh_a.first.at(y, x),
+                                        pars.qxa.at(y, x),
+                                        pars.qya.at(y, x),
+                                        interp_fx,
+                                        interp_fy,
+                                        interpolationLookup,
+                                        pars.beamsIndexInterpolation);
+                                pars.hrtemInterpolationIndices.push_back(interpInfo.indices);
+                                pars.hrtemInterpolationWeights.push_back(interpInfo.weights);
+                                ++pars.numberBeams;
+                        }
+                }
+        }
+
+        pars.beamsIndex = requestedIndices;
+        pars.beams = zeros_ND<2, PRISMATIC_FLOAT_PRECISION>({{pars.imageSize[0], pars.imageSize[1]}});
+        {
+                int beam_count = 1;
+                for (const auto &flatIndex : pars.beamsIndex)
+                {
+                        const size_t x = flatIndex % pars.qMask.get_dimi();
+                        const size_t y = flatIndex / pars.qMask.get_dimi();
+                        pars.beams.at(y, x) = beam_count++;
+                }
+        }
+
+        std::cout << "Number of total tilts: " << pars.numberBeams << std::endl;
+
 }
+
 
 inline void setupSMatrixCoordinates(Parameters<PRISMATIC_FLOAT_PRECISION> &pars)
 {
@@ -374,7 +554,7 @@ void propagatePlaneWave_CPU(Parameters<PRISMATIC_FLOAT_PRECISION> &pars,
 }
 
 void propagatePlaneWave_CPU_batch(Parameters<PRISMATIC_FLOAT_PRECISION> &pars,
-								  size_t currentBeam,
+                                                                  size_t currentBeam,
 								  size_t stopBeam,
 								  Array1D<complex<PRISMATIC_FLOAT_PRECISION>> &psi_stack,
 								  const PRISMATIC_FFTW_PLAN &plan_forward,
@@ -474,7 +654,47 @@ void propagatePlaneWave_CPU_batch(Parameters<PRISMATIC_FLOAT_PRECISION> &pars,
 	}
 	gatekeeper.lock();
 	PRISMATIC_FFTW_DESTROY_PLAN(plan_final);
-	gatekeeper.unlock();
+        gatekeeper.unlock();
+}
+
+void applyHRTEMInterpolation(Parameters<PRISMATIC_FLOAT_PRECISION> &pars,
+                                                         const size_t propagationBeams,
+                                                         const size_t requestedBeams)
+{
+        if (pars.meta.algorithm != Algorithm::HRTEM)
+                return;
+        if (pars.hrtemInterpolationIndices.empty())
+                return;
+        if (propagationBeams == requestedBeams)
+                return;
+
+        const auto baseScompact = pars.Scompact;
+        Array3D<complex<PRISMATIC_FLOAT_PRECISION>> interpolated = zeros_ND<3, complex<PRISMATIC_FLOAT_PRECISION>>(
+                {{requestedBeams, baseScompact.get_dimj(), baseScompact.get_dimi()}});
+
+        const size_t availableMappings = std::min(requestedBeams, pars.hrtemInterpolationIndices.size());
+        const size_t mappedBeams = std::min(availableMappings, pars.hrtemInterpolationWeights.size());
+        for (size_t beamIdx = 0; beamIdx < mappedBeams; ++beamIdx)
+        {
+                const auto &indices = pars.hrtemInterpolationIndices[beamIdx];
+                const auto &weights = pars.hrtemInterpolationWeights[beamIdx];
+                for (size_t neighbor = 0; neighbor < indices.size(); ++neighbor)
+                {
+                        const size_t sourceIdx = indices[neighbor];
+                        const auto weight = weights[neighbor];
+                        if (weight == 0 || sourceIdx >= baseScompact.get_dimk())
+                                continue;
+                        for (auto y = 0; y < baseScompact.get_dimj(); ++y)
+                        {
+                                for (auto x = 0; x < baseScompact.get_dimi(); ++x)
+                                {
+                                        interpolated.at(beamIdx, y, x) += weight * baseScompact.at(sourceIdx, y, x);
+                                }
+                        }
+                }
+        }
+
+        pars.Scompact = std::move(interpolated);
 }
 
 void fill_Scompact_CPUOnly(Parameters<PRISMATIC_FLOAT_PRECISION> &pars)
@@ -755,17 +975,29 @@ void PRISM02_calcSMatrix(Parameters<PRISMATIC_FLOAT_PRECISION> &pars)
 	}
 
 	// setup coordinates for nonzero values of compact S-matrix
-	setupSMatrixCoordinates(pars);
+        setupSMatrixCoordinates(pars);
 
-	cout << "Computing compact S matrix" << endl;
+        cout << "Computing compact S matrix" << endl;
 
 #ifdef PRISMATIC_BUILDING_GUI
 	pars.progressbar->signalDescriptionMessage("Computing compact S-matrix");
 	pars.progressbar->signalScompactUpdate(-1, pars.numberBeams);
 #endif //PRISMATIC_BUILDING_GUI
 
-	// populate compact S-matrix
-	fill_Scompact(pars);
+        const size_t requestedBeams = pars.numberBeams;
+        const size_t propagationBeams = (pars.meta.algorithm == Algorithm::HRTEM && pars.numberBeamsInterpolation > 0)
+                                                                         ? pars.numberBeamsInterpolation
+                                                                         : pars.numberBeams;
+        const auto requestedBeamIndex = pars.beamsIndex;
+        const auto propagationBeamIndex = pars.beamsIndexInterpolation.empty() ? pars.beamsIndex : pars.beamsIndexInterpolation;
+
+        // populate compact S-matrix
+        pars.numberBeams = propagationBeams;
+        pars.beamsIndex = propagationBeamIndex;
+        fill_Scompact(pars);
+        pars.numberBeams = requestedBeams;
+        pars.beamsIndex = requestedBeamIndex;
+        applyHRTEMInterpolation(pars, propagationBeams, requestedBeams);
 
 	// only keep the relevant/nonzero Fourier components
 	downsampleFourierComponents(pars);
