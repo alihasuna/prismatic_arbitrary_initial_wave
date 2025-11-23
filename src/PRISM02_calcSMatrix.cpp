@@ -439,6 +439,8 @@ inline void setupBeams_HRTEM(Parameters<PRISMATIC_FLOAT_PRECISION> &pars)
 
         std::cout << "Number of total tilts: " << pars.numberBeams << std::endl;
 
+}
+
 
 inline void setupSMatrixCoordinates(Parameters<PRISMATIC_FLOAT_PRECISION> &pars)
 {

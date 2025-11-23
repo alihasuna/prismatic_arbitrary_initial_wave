@@ -51,3 +51,5 @@ ls prismatique-output
 ```
 
 If you keep the working directory inside your repository, the run will pick up the latest compiled binary and the tilt metadata emitted by your wrapper. You can rerun the same job after rebuilding to compare HRTEM S-matrix outputs before and after code changes.
+
+For a fuller example that generates arbitrary tilt lists and wires them into prismatique, see [prismatique-arbitrary-wave.md](prismatique-arbitrary-wave.md).
