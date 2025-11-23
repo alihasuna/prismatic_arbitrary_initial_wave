@@ -16,6 +16,7 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <array>
 #include <mutex>
 #include <complex>
 #include "ArrayND.h"
@@ -76,14 +77,17 @@ namespace Prismatic{
 		T yTiltOffset_tem;
 		T xTiltStep_tem;
 		T yTiltStep_tem;
-		std::vector<T> xTilts_tem;
-		std::vector<T> yTilts_tem;
-		std::vector<int> xTiltsInd_tem;
-		std::vector<int> yTiltsInd_tem;
-	    Array2D<T> qxa;
-	    Array2D<T> qya;
-	    Array2D<T> qxaOutput;
-	    Array2D<T> qyaOutput;
+            std::vector<T> xTilts_tem;
+            std::vector<T> yTilts_tem;
+            std::vector<int> xTiltsInd_tem;
+            std::vector<int> yTiltsInd_tem;
+            // Mapping from requested tilts to propagated beams
+            std::vector<std::array<size_t, 4>> hrtemInterpolationIndices;
+            std::vector<std::array<T, 4>> hrtemInterpolationWeights;
+            Array2D<T> qxa;
+            Array2D<T> qya;
+            Array2D<T> qxaOutput;
+            Array2D<T> qyaOutput;
         Array2D<T> qxaReduce;
         Array2D<T> qyaReduce;
 	    Array2D<T> alphaInd;
@@ -93,12 +97,14 @@ namespace Prismatic{
         Array1D<T> xp;
         Array1D<T> yp;
 		Array1D<T> qx;
-		Array1D<T> qy;
+            Array1D<T> qy;
         std::vector<size_t> beamsIndex;
-		std::vector<size_t> HRTEMbeamOrder;
-	    Prismatic::ArrayND<2, std::vector<long> > xyBeams;
-		Array2D<T> beams;
-	    Array2D<T> beamsOutput;
+        // beam ordering used for coarse propagation grid when interpolating HRTEM tilts
+        std::vector<size_t> beamsIndexInterpolation;
+        std::vector<size_t> HRTEMbeamOrder;
+            Prismatic::ArrayND<2, std::vector<long> > xyBeams;
+            Array2D<T> beams;
+            Array2D<T> beamsOutput;
         Array1D<T> xVec;
         Array1D<T> yVec;
         Array1D<T> detectorAngles;
@@ -108,11 +114,13 @@ namespace Prismatic{
 		T dzPot;
 	    Array1D<size_t> imageSize;
 	    std::vector<size_t> imageSizeReduce;
-	    Array1D<size_t> imageSizeOutput;
-	    Array1D<size_t> qxInd;
-	    Array1D<size_t> qyInd;
-	    std::vector<T> tiledCellDim;
-	    T scale;
+            Array1D<size_t> imageSizeOutput;
+            Array1D<size_t> qxInd;
+            Array1D<size_t> qyInd;
+            // number of coarse beams evaluated before applying HRTEM interpolation weights
+            size_t numberBeamsInterpolation = 0;
+            std::vector<T> tiledCellDim;
+            T scale;
         T lambda;
         T dr;
         T dq;
